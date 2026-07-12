@@ -17,5 +17,5 @@ const FYNLO_CONFIG = {
   PRODUCTION_API_URL: 'https://fynlo-design.vercel.app',
 
   // Used automatically when running on localhost — no need to change this.
-  LOCAL_API_URL: 'http://localhost:3000',
+  //LOCAL_API_URL: 'http://localhost:3000',
 };
