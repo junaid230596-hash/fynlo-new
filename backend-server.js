@@ -175,6 +175,10 @@ async function initDatabase() {
       -- before this feature was added.
       ALTER TABLE users ADD COLUMN IF NOT EXISTS is_super_admin BOOLEAN DEFAULT false;
       ALTER TABLE users ADD COLUMN IF NOT EXISTS admin_permissions JSONB DEFAULT '["dashboard"]';
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT false;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_verified BOOLEAN DEFAULT false;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT false;
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_verified BOOLEAN DEFAULT false;
 
       -- 3. SUBSCRIPTIONS
       CREATE TABLE IF NOT EXISTS subscriptions (
@@ -390,6 +394,38 @@ async function initDatabase() {
         is_read     BOOLEAN DEFAULT false,
         read_at     TIMESTAMP,
         created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+
+      -- 15. PERSONAL EXPENSES & TO-DOS (individual accounts)
+      CREATE TABLE IF NOT EXISTS personal_expenses (
+        id           SERIAL PRIMARY KEY,
+        user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        category     VARCHAR(100) NOT NULL,
+        description  TEXT,
+        amount       DECIMAL(10,2) NOT NULL DEFAULT 0,
+        expense_date DATE DEFAULT CURRENT_DATE,
+        created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS personal_todos (
+        id          SERIAL PRIMARY KEY,
+        user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        title       VARCHAR(500) NOT NULL,
+        is_done     BOOLEAN DEFAULT false,
+        created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS personal_invoices (
+        id             SERIAL PRIMARY KEY,
+        user_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        invoice_number VARCHAR(50) NOT NULL,
+        client_name    VARCHAR(255) NOT NULL,
+        client_email   VARCHAR(255),
+        items          JSONB NOT NULL DEFAULT '[]',
+        total_amount   DECIMAL(10,2) NOT NULL DEFAULT 0,
+        status         VARCHAR(50) DEFAULT 'unpaid',
+        invoice_date   DATE DEFAULT CURRENT_DATE,
+        created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
 
       -- 14. TEAM CONVERSATIONS (group chat — business owner + employees)
@@ -712,7 +748,7 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(400).json({ error: 'Email and password required' });
 
     const result = await pool.query(
-      'SELECT id, email, name, password_hash, business_id, role, avatar, is_super_admin, admin_permissions FROM users WHERE email = $1 AND is_active = true',
+      'SELECT id, email, name, phone, password_hash, business_id, role, avatar, is_super_admin, admin_permissions, email_verified, phone_verified FROM users WHERE email = $1 AND is_active = true',
       [email]
     );
     if (!result.rows.length)
@@ -729,12 +765,48 @@ app.post('/api/auth/login', async (req, res) => {
     const token = generateToken(user.id, user.business_id, user.role);
     res.json({
       token,
-      user: { id: user.id, email: user.email, name: user.name, role: user.role, avatar: user.avatar, businessId: user.business_id,
-              isSuperAdmin: user.is_super_admin, adminPermissions: user.admin_permissions },
+      user: { id: user.id, email: user.email, name: user.name, phone: user.phone, role: user.role, avatar: user.avatar, businessId: user.business_id,
+              isSuperAdmin: user.is_super_admin, adminPermissions: user.admin_permissions,
+              emailVerified: user.email_verified, phoneVerified: user.phone_verified },
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// In-memory store for short-lived verification codes (demo mode — no email/SMS
+// service is wired up, so the code is returned directly in the response instead
+// of being sent externally; real delivery can replace this later without
+// changing the frontend contract).
+const verifyCodes = new Map(); // key: `${userId}:${type}` -> { code, expires }
+
+app.post('/api/auth/send-verify-code', auth, async (req, res) => {
+  try {
+    const { type } = req.body; // 'email' | 'phone'
+    if (!['email', 'phone'].includes(type)) return res.status(400).json({ error: 'type must be email or phone' });
+
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    verifyCodes.set(`${req.user.userId}:${type}`, { code, expires: Date.now() + 10 * 60 * 1000 });
+
+    // Demo mode: return the code directly since there's no email/SMS service configured yet.
+    res.json({ success: true, demoCode: code });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/auth/confirm-verify-code', auth, async (req, res) => {
+  try {
+    const { type, code } = req.body;
+    if (!['email', 'phone'].includes(type)) return res.status(400).json({ error: 'type must be email or phone' });
+
+    const entry = verifyCodes.get(`${req.user.userId}:${type}`);
+    if (!entry || entry.expires < Date.now()) return res.status(400).json({ error: 'Code expired — send a new one' });
+    if (entry.code !== String(code).trim()) return res.status(400).json({ error: 'Incorrect code' });
+
+    const column = type === 'email' ? 'email_verified' : 'phone_verified';
+    await pool.query(`UPDATE users SET ${column}=true WHERE id=$1`, [req.user.userId]);
+    verifyCodes.delete(`${req.user.userId}:${type}`);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post('/api/auth/reset-password', auth, async (req, res) => {
@@ -753,6 +825,20 @@ app.post('/api/auth/reset-password', auth, async (req, res) => {
 
     const newHash = await bcrypt.hash(newPassword, 10);
     await pool.query('UPDATE users SET password_hash=$1 WHERE id=$2', [newHash, req.user.userId]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Persists email/phone verification status. NOTE: there's no email/SMS provider wired up
+// yet, so the code itself is generated and shown client-side (clearly labeled as a demo) —
+// this endpoint is what makes the *result* real: once confirmed, it's saved on the account
+// for good, ready to swap in a real provider later without changing this contract.
+app.post('/api/auth/verify-contact', auth, async (req, res) => {
+  try {
+    const { type } = req.body;
+    if (!['email', 'phone'].includes(type)) return res.status(400).json({ error: 'type must be "email" or "phone"' });
+    const column = type === 'email' ? 'email_verified' : 'phone_verified';
+    await pool.query(`UPDATE users SET ${column}=true WHERE id=$1`, [req.user.userId]);
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -966,6 +1052,19 @@ app.get('/api/businesses', auth, requireAdminSection('shopkeepers'), async (req,
     if (status) { params.push(status); q += ` AND b.status = $${params.length}`; }
     if (plan)   { params.push(plan);   q += ` AND b.subscription_plan = $${params.length}`; }
     q += ' ORDER BY b.created_at DESC';
+    const result = await pool.query(q, params);
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Individual (personal) accounts — separate from businesses
+app.get('/api/admin/individuals', auth, requireAdminSection('individuals'), async (req, res) => {
+  try {
+    const { search } = req.query;
+    let q = `SELECT id, name, email, phone, avatar, created_at FROM users WHERE role='individual'`;
+    const params = [];
+    if (search) { params.push(`%${search}%`); q += ` AND (name ILIKE $${params.length} OR email ILIKE $${params.length})`; }
+    q += ' ORDER BY created_at DESC';
     const result = await pool.query(q, params);
     res.json(result.rows);
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -1856,7 +1955,7 @@ app.delete('/api/conversations/:id/members/:userId', auth, async (req, res) => {
 
 app.get('/api/profile', auth, async (req, res) => {
   try {
-    const user = await pool.query('SELECT id,email,name,role,avatar,phone FROM users WHERE id=$1', [req.user.userId]);
+    const user = await pool.query('SELECT id,email,name,role,avatar,phone,email_verified,phone_verified FROM users WHERE id=$1', [req.user.userId]);
     let business = null;
     if (req.user.businessId) {
       const biz = await pool.query('SELECT * FROM businesses WHERE id=$1', [req.user.businessId]);
@@ -1899,6 +1998,132 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
+// ═══════════════════════════════════════════════════════════
+// PERSONAL EXPENSES & TO-DOS (individual accounts)
+// ═══════════════════════════════════════════════════════════
+
+app.get('/api/personal-expenses', auth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM personal_expenses WHERE user_id=$1 ORDER BY expense_date DESC, created_at DESC',
+      [req.user.userId]
+    );
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/personal-expenses', auth, async (req, res) => {
+  try {
+    const { category, description, amount, expense_date } = req.body;
+    if (!category || !amount) return res.status(400).json({ error: 'Category and amount are required' });
+    const result = await pool.query(
+      'INSERT INTO personal_expenses (user_id,category,description,amount,expense_date) VALUES ($1,$2,$3,$4,$5) RETURNING *',
+      [req.user.userId, category, description||null, amount, expense_date||new Date().toISOString().slice(0,10)]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/personal-expenses/:id', auth, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM personal_expenses WHERE id=$1 AND user_id=$2', [req.params.id, req.user.userId]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/personal-todos', auth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM personal_todos WHERE user_id=$1 ORDER BY is_done ASC, created_at DESC',
+      [req.user.userId]
+    );
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/personal-todos', auth, async (req, res) => {
+  try {
+    const { title } = req.body;
+    if (!title) return res.status(400).json({ error: 'Title is required' });
+    const result = await pool.query(
+      'INSERT INTO personal_todos (user_id,title) VALUES ($1,$2) RETURNING *',
+      [req.user.userId, title]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch('/api/personal-todos/:id', auth, async (req, res) => {
+  try {
+    const { is_done } = req.body;
+    const result = await pool.query(
+      'UPDATE personal_todos SET is_done=$1 WHERE id=$2 AND user_id=$3 RETURNING *',
+      [is_done, req.params.id, req.user.userId]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
+    res.json(result.rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/personal-todos/:id', auth, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM personal_todos WHERE id=$1 AND user_id=$2', [req.params.id, req.user.userId]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════
+// PERSONAL QUICK INVOICES (individual accounts — freelancer-style billing)
+// ═══════════════════════════════════════════════════════════
+
+app.get('/api/personal-invoices', auth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM personal_invoices WHERE user_id=$1 ORDER BY created_at DESC',
+      [req.user.userId]
+    );
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/personal-invoices', auth, async (req, res) => {
+  try {
+    const { client_name, client_email, items, invoice_date } = req.body;
+    if (!client_name || !Array.isArray(items) || !items.length)
+      return res.status(400).json({ error: 'Client name and at least one item are required' });
+
+    const total = items.reduce((s, i) => s + (parseFloat(i.amount) || 0), 0);
+    const countRes = await pool.query('SELECT COUNT(*) FROM personal_invoices WHERE user_id=$1', [req.user.userId]);
+    const invoiceNumber = `PI-${String(parseInt(countRes.rows[0].count) + 1).padStart(4, '0')}`;
+
+    const result = await pool.query(
+      `INSERT INTO personal_invoices (user_id,invoice_number,client_name,client_email,items,total_amount,invoice_date)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [req.user.userId, invoiceNumber, client_name, client_email || null, JSON.stringify(items), total, invoice_date || new Date().toISOString().slice(0,10)]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch('/api/personal-invoices/:id', auth, async (req, res) => {
+  try {
+    const { status } = req.body;
+    const result = await pool.query(
+      'UPDATE personal_invoices SET status=$1 WHERE id=$2 AND user_id=$3 RETURNING *',
+      [status, req.params.id, req.user.userId]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: 'Not found' });
+    res.json(result.rows[0]);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/personal-invoices/:id', auth, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM personal_invoices WHERE id=$1 AND user_id=$2', [req.params.id, req.user.userId]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 app.use((req, res) => {
   res.status(404).json({ error: `Route ${req.method} ${req.path} not found` });
 });
@@ -1921,7 +2146,7 @@ async function start() {
     await initDatabase();
     app.listen(PORT, () => {
       console.log('');
-      console.log('  SkipHub API is running!');
+      console.log('  Fynlo API is running!');
       console.log(`  Local:   http://localhost:${PORT}`);
       console.log(`  Health:  http://localhost:${PORT}/health`);
       console.log('');
