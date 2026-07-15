@@ -475,6 +475,30 @@ async function initDatabase() {
 
     `);
     console.log('✓ Database schema ready');
+
+    // Recovery step: the is_super_admin/admin_permissions columns were added after
+    // some admin accounts may have already existed. Postgres applies the column
+    // DEFAULT to those existing rows (is_super_admin=false, permissions=[dashboard]),
+    // which would otherwise silently lock out whoever was actually running the
+    // platform with no way to fix it from the UI (self-registration is blocked once
+    // any admin exists). If there's no super admin yet, promote the earliest-created
+    // admin account so someone can always get back in and manage permissions.
+    const superAdminCheck = await client.query(
+      "SELECT COUNT(*) FROM users WHERE role='admin' AND is_super_admin=true"
+    );
+    if (parseInt(superAdminCheck.rows[0].count) === 0) {
+      const oldestAdmin = await client.query(
+        "SELECT id, email FROM users WHERE role='admin' ORDER BY created_at ASC LIMIT 1"
+      );
+      if (oldestAdmin.rows.length) {
+        const allSections = ['dashboard','shopkeepers','individuals','all-products','all-invoices','analytics','notifications','chat','feedback','admins','settings','data-explorer'];
+        await client.query(
+          'UPDATE users SET is_super_admin=true, admin_permissions=$1 WHERE id=$2',
+          [JSON.stringify(allSections), oldestAdmin.rows[0].id]
+        );
+        console.log(`✓ Promoted ${oldestAdmin.rows[0].email} to super admin (no super admin existed)`);
+      }
+    }
   } catch (err) {
     console.error('✗ Schema init error:', err.message);
     throw err;
@@ -687,7 +711,7 @@ app.post('/api/auth/register', async (req, res) => {
 
     await client.query('BEGIN');
 
-    const allSections = ['dashboard','shopkeepers','all-products','all-invoices','analytics','notifications','chat','feedback','admins','settings','data-explorer'];
+    const allSections = ['dashboard','shopkeepers','individuals','all-products','all-invoices','analytics','notifications','chat','feedback','admins','settings','data-explorer'];
 
     // Create user (no business_id yet)
     const userRes = await client.query(
@@ -2146,7 +2170,7 @@ async function start() {
     await initDatabase();
     app.listen(PORT, () => {
       console.log('');
-      console.log('  Fynlo API is running!');
+      console.log('  SkipHub API is running!');
       console.log(`  Local:   http://localhost:${PORT}`);
       console.log(`  Health:  http://localhost:${PORT}/health`);
       console.log('');
