@@ -943,7 +943,7 @@ app.post('/api/admin/bootstrap', async (req, res) => {
     const result = await pool.query(
       `INSERT INTO users (email,password_hash,name,role,avatar,is_super_admin,admin_permissions)
        VALUES ($1,$2,$3,'admin',$4,true,$5) RETURNING id`,
-      [email, passwordHash, name, avatar, JSON.stringify(['dashboard','shopkeepers','all-products','all-invoices','analytics','notifications','chat','feedback','admins','settings'])]
+      [email, passwordHash, name, avatar, JSON.stringify(['dashboard','shopkeepers','individuals','all-products','all-invoices','analytics','notifications','chat','feedback','admins','settings','data-explorer'])]
     );
     res.status(201).json({ success: true, id: result.rows[0].id, message: 'First admin created — you can now log in.' });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -1044,18 +1044,50 @@ app.patch('/api/admin/users/:id/permissions', auth, superAdminOnly, async (req, 
 
 // Safe, allowlisted read-only browser across key tables — never exposes password_hash.
 const DATA_EXPLORER_TABLES = {
-  businesses : { query: 'SELECT id,shop_name,category,email,phone,city,country,subscription_plan,subscription_status,status,created_at FROM businesses ORDER BY created_at DESC LIMIT 500' },
-  users      : { query: "SELECT id,name,email,role,phone,is_active,created_at FROM users ORDER BY created_at DESC LIMIT 500" },
-  products   : { query: 'SELECT id,business_id,name,sku,category,price,stock_quantity,created_at FROM products ORDER BY created_at DESC LIMIT 500' },
-  invoices   : { query: 'SELECT id,business_id,invoice_number,customer_name,total_amount,payment_status,invoice_date FROM invoices ORDER BY invoice_date DESC LIMIT 500' },
-  employees  : { query: 'SELECT id,business_id,name,email,position,salary,status,hire_date FROM employees ORDER BY created_at DESC LIMIT 500' },
-  attendance : { query: 'SELECT id,business_id,employee_id,attendance_date,status,check_in_time,check_out_time FROM attendance ORDER BY attendance_date DESC LIMIT 500' },
-  payroll    : { query: 'SELECT id,business_id,employee_id,payroll_month,gross_salary,net_salary,status FROM payroll ORDER BY created_at DESC LIMIT 500' },
-  subscriptions: { query: 'SELECT id,business_id,plan_name,price,max_products,max_employees,is_active,created_at FROM subscriptions ORDER BY created_at DESC LIMIT 500' },
+  businesses : {
+    query: 'SELECT id,shop_name,category,email,phone,city,country,subscription_plan,subscription_status,status,created_at FROM businesses ORDER BY created_at DESC LIMIT 500',
+    editable: ['shop_name','category','email','phone','city','country','subscription_plan','subscription_status','status'],
+  },
+  users      : {
+    query: "SELECT id,name,email,role,phone,is_active,created_at FROM users ORDER BY created_at DESC LIMIT 500",
+    // 'role' is deliberately excluded — role changes go through Create Account / permissions instead,
+    // so this raw table editor can't be used as a backdoor to self-promote to admin.
+    editable: ['name','email','phone','is_active'],
+  },
+  products   : {
+    query: 'SELECT id,business_id,name,sku,category,price,stock_quantity,created_at FROM products ORDER BY created_at DESC LIMIT 500',
+    editable: ['name','sku','category','price','stock_quantity'],
+  },
+  invoices   : {
+    query: 'SELECT id,business_id,invoice_number,customer_name,total_amount,payment_status,invoice_date FROM invoices ORDER BY invoice_date DESC LIMIT 500',
+    editable: ['customer_name','total_amount','payment_status'],
+  },
+  employees  : {
+    query: 'SELECT id,business_id,name,email,position,salary,status,hire_date FROM employees ORDER BY created_at DESC LIMIT 500',
+    editable: ['name','email','position','salary','status'],
+  },
+  attendance : {
+    query: 'SELECT id,business_id,employee_id,attendance_date,status,check_in_time,check_out_time FROM attendance ORDER BY attendance_date DESC LIMIT 500',
+    editable: ['status','check_in_time','check_out_time'],
+  },
+  payroll    : {
+    query: 'SELECT id,business_id,employee_id,payroll_month,gross_salary,net_salary,status FROM payroll ORDER BY created_at DESC LIMIT 500',
+    editable: ['gross_salary','net_salary','status'],
+  },
+  subscriptions: {
+    query: 'SELECT id,business_id,plan_name,price,max_products,max_employees,is_active,created_at FROM subscriptions ORDER BY created_at DESC LIMIT 500',
+    editable: ['plan_name','price','max_products','max_employees','is_active'],
+  },
 };
 
 app.get('/api/admin/data-explorer/tables', auth, requireAdminSection('data-explorer'), (req, res) => {
   res.json(Object.keys(DATA_EXPLORER_TABLES));
+});
+
+app.get('/api/admin/data-explorer/:table/editable-columns', auth, requireAdminSection('data-explorer'), (req, res) => {
+  const table = DATA_EXPLORER_TABLES[req.params.table];
+  if (!table) return res.status(400).json({ error: 'Unknown or restricted table' });
+  res.json(table.editable);
 });
 
 app.get('/api/admin/data-explorer/:table', auth, requireAdminSection('data-explorer'), async (req, res) => {
@@ -1064,6 +1096,36 @@ app.get('/api/admin/data-explorer/:table', auth, requireAdminSection('data-explo
     if (!table) return res.status(400).json({ error: 'Unknown or restricted table' });
     const result = await pool.query(table.query);
     res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.patch('/api/admin/data-explorer/:table/:id', auth, requireAdminSection('data-explorer'), async (req, res) => {
+  try {
+    const tableName = req.params.table;
+    const table = DATA_EXPLORER_TABLES[tableName];
+    if (!table) return res.status(400).json({ error: 'Unknown or restricted table' });
+
+    // Only columns explicitly whitelisted per table can ever be written — the column
+    // names themselves are never taken from the request, only looked up against this list,
+    // so there's no way to inject an arbitrary column (or table) via the request body.
+    const updates = Object.entries(req.body).filter(([col]) => table.editable.includes(col));
+    if (!updates.length) return res.status(400).json({ error: 'No editable fields provided' });
+
+    const setClause = updates.map(([col], i) => `${col}=$${i + 1}`).join(', ');
+    const values = updates.map(([, val]) => val);
+    values.push(req.params.id);
+
+    await pool.query(`UPDATE ${tableName} SET ${setClause} WHERE id=$${values.length}`, values);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/admin/data-explorer/:table/:id', auth, requireAdminSection('data-explorer'), async (req, res) => {
+  try {
+    const tableName = req.params.table;
+    if (!DATA_EXPLORER_TABLES[tableName]) return res.status(400).json({ error: 'Unknown or restricted table' });
+    await pool.query(`DELETE FROM ${tableName} WHERE id=$1`, [req.params.id]);
+    res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
