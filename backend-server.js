@@ -584,12 +584,41 @@ function validateQRSubmission(submission, expectedBusinessId) {
 }
 
 // Auth middleware
+// Paths a locked-out (expired Pro) business must still be able to reach —
+// otherwise they'd have no way to see their status or pay to renew.
+const SUBSCRIPTION_CHECK_ALLOWLIST = [
+  '/api/profile', '/api/subscription', '/api/payments/create-order',
+  '/api/payments/verify', '/api/auth/reset-password',
+];
+
 const auth = async (req, res, next) => {
   const token = req.headers.authorization?.split(' ')[1];
   if (!token) return res.status(401).json({ error: 'No token provided' });
   const decoded = verifyToken(token);
   if (!decoded) return res.status(401).json({ error: 'Invalid or expired token' });
   req.user = decoded;
+
+  if (decoded.role === 'business' && decoded.businessId && !SUBSCRIPTION_CHECK_ALLOWLIST.includes(req.path)) {
+    try {
+      const sub = await pool.query(
+        'SELECT plan_name, current_period_end FROM subscriptions WHERE business_id=$1 AND is_active=true ORDER BY created_at DESC LIMIT 1',
+        [decoded.businessId]
+      );
+      const s = sub.rows[0];
+      const isExpiredPro = s && s.plan_name === 'Pro' && s.current_period_end && new Date(s.current_period_end) < new Date();
+      if (isExpiredPro) {
+        return res.status(402).json({
+          error: 'subscription_expired',
+          message: 'Your Pro subscription has expired. Renew to continue using Fynlo.',
+        });
+      }
+    } catch (err) {
+      // If the subscription check itself fails, fail open rather than locking
+      // everyone out due to an unrelated DB hiccup.
+      console.error('Subscription check error:', err.message);
+    }
+  }
+
   next();
 };
 
@@ -1175,17 +1204,23 @@ app.patch('/api/businesses/:id/plan', auth, requireAdminSection('shopkeepers'), 
     const lim = planLimits[plan_name];
     if (!lim) return res.status(400).json({ error: 'Plan must be Free or Pro' });
 
+    // Pro lasts 30 days from now (renewal is manual — there's no auto-recurring
+    // charge); Free never expires, so its period_end stays null.
+    const periodEnd = plan_name === 'Pro'
+      ? new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+      : null;
+
     await pool.query(
       'UPDATE businesses SET subscription_plan=$1, subscription_status=\'active\', updated_at=NOW() WHERE id=$2',
       [plan_name, req.params.id]
     );
     await pool.query(
-      `INSERT INTO subscriptions (business_id,plan_name,price,currency,max_products,max_employees,max_invoices_per_month)
-       VALUES ($1,$2,$3,'INR',$4,$5,$6)
-       ON CONFLICT (business_id) DO UPDATE SET plan_name=$2,price=$3,max_products=$4,max_employees=$5,max_invoices_per_month=$6,updated_at=NOW()`,
-      [req.params.id, plan_name, lim.price, lim.max_products, lim.max_employees, lim.max_invoices_per_month]
+      `INSERT INTO subscriptions (business_id,plan_name,price,currency,max_products,max_employees,max_invoices_per_month,current_period_start,current_period_end)
+       VALUES ($1,$2,$3,'INR',$4,$5,$6,CURRENT_DATE,$7)
+       ON CONFLICT (business_id) DO UPDATE SET plan_name=$2,price=$3,max_products=$4,max_employees=$5,max_invoices_per_month=$6,current_period_start=CURRENT_DATE,current_period_end=$7,updated_at=NOW()`,
+      [req.params.id, plan_name, lim.price, lim.max_products, lim.max_employees, lim.max_invoices_per_month, periodEnd]
     );
-    res.json({ success: true, plan_name });
+    res.json({ success: true, plan_name, current_period_end: periodEnd });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -1726,16 +1761,22 @@ app.post('/api/payments/verify', auth, async (req, res) => {
         Free: { max_products: 10,     max_employees: 2,      max_invoices_per_month: 10 },
         Pro : { max_products: 999999, max_employees: 999999, max_invoices_per_month: 999999 },
       };
+      // Pro lasts 30 days from this payment — renewal is manual (no auto-recurring
+      // charge yet), so the business needs to come back and pay again to extend it.
+      const periodEnd = plan_name === 'Pro'
+        ? new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+        : null;
+
       await pool.query(
         'UPDATE businesses SET subscription_plan=$1, subscription_status=\'active\', updated_at=NOW() WHERE id=$2',
         [plan_name, req.user.businessId]
       );
       const lim = planLimits[plan_name] || planLimits.Free;
       await pool.query(
-        `INSERT INTO subscriptions (business_id,plan_name,price,currency,max_products,max_employees,max_invoices_per_month,razorpay_subscription_id)
-         VALUES ($1,$2,$3,'INR',$4,$5,$6,$7)
-         ON CONFLICT (business_id) DO UPDATE SET plan_name=$2,price=$3,max_products=$4,max_employees=$5,max_invoices_per_month=$6,updated_at=NOW()`,
-        [req.user.businessId, plan_name, planPrices[plan_name] ?? 999, lim.max_products, lim.max_employees, lim.max_invoices_per_month, razorpay_payment_id]
+        `INSERT INTO subscriptions (business_id,plan_name,price,currency,max_products,max_employees,max_invoices_per_month,razorpay_subscription_id,current_period_start,current_period_end)
+         VALUES ($1,$2,$3,'INR',$4,$5,$6,$7,CURRENT_DATE,$8)
+         ON CONFLICT (business_id) DO UPDATE SET plan_name=$2,price=$3,max_products=$4,max_employees=$5,max_invoices_per_month=$6,current_period_start=CURRENT_DATE,current_period_end=$8,updated_at=NOW()`,
+        [req.user.businessId, plan_name, planPrices[plan_name] ?? 999, lim.max_products, lim.max_employees, lim.max_invoices_per_month, razorpay_payment_id, periodEnd]
       ).catch((e) => console.error('Subscription upsert failed:', e.message));
     }
 
